@@ -1,0 +1,80 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'gitdrop.py'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+# Не даём двум выкатам ехать одновременно; лишние в очереди отменяются.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Проверить синтаксис перед выкатом
+        run: python3 -m py_compile gitdrop.py
+
+      - name: Настроить SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Скопировать gitdrop.py на сервер
+        id: copy
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          # Бэкапим текущую версию, держим последние 5.
+          ssh -o BatchMode=yes root@"$HOST" '
+            cp /opt/gitdrop/gitdrop.py /opt/gitdrop/gitdrop.py.bak-$(date +%Y%m%d-%H%M%S)
+            ls -t /opt/gitdrop/gitdrop.py.bak-* | tail -n +6 | xargs -r rm --
+          '
+          scp -o BatchMode=yes gitdrop.py root@"$HOST":/opt/gitdrop/gitdrop.py
+
+      - name: Перезапустить сервис
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+        run: ssh -o BatchMode=yes root@"$HOST" 'systemctl restart gitdrop'
+
+      - name: Проверить, что поднялось
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          sleep 3
+          ssh -o BatchMode=yes root@"$HOST" '
+            systemctl is-active --quiet gitdrop || { echo "сервис не активен"; journalctl -u gitdrop -n 30 --no-pager; exit 1; }
+            curl -sf -o /dev/null --max-time 10 http://127.0.0.1:7070/ || { echo "порт 7070 не отвечает"; journalctl -u gitdrop -n 30 --no-pager; exit 1; }
+          '
+          # Сверяем, что на сервере лежит ровно то, что в этом коммите.
+          LOCAL=$(md5sum gitdrop.py | cut -d' ' -f1)
+          REMOTE=$(ssh -o BatchMode=yes root@"$HOST" 'md5sum /opt/gitdrop/gitdrop.py' | cut -d' ' -f1)
+          [ "$LOCAL" = "$REMOTE" ] || { echo "md5 не совпал: $LOCAL != $REMOTE"; exit 1; }
+          echo "выкачено и проверено: $LOCAL"
+
+      # Откат только если файл уже успели тронуть. Если упал py_compile,
+      # на сервере ничего не менялось — откатывать нечего.
+      - name: Откатиться, если выкат сломался
+        if: failure() && steps.copy.outcome != 'skipped'
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          ssh -o BatchMode=yes root@"$HOST" '
+            BAK=$(ls -t /opt/gitdrop/gitdrop.py.bak-* 2>/dev/null | head -1)
+            [ -n "$BAK" ] || { echo "бэкапа нет, откатывать нечего"; exit 1; }
+            cp "$BAK" /opt/gitdrop/gitdrop.py
+            systemctl restart gitdrop
+            echo "откатились на $BAK"
+          '
