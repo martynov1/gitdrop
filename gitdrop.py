@@ -533,7 +533,7 @@ async function handleDrop(e){
 }
 
 function dlFile(id,name){const url=API+'/api/files/'+id+(TOKEN?'?token='+encodeURIComponent(TOKEN):'');const a=document.createElement('a');a.href=url;a.download=name;a.click();addLog('info',`fetch: ${name} → local`)}
-function cpLink(id){const url=location.origin+'/api/files/'+id;navigator.clipboard.writeText(url).then(()=>{const btn=document.getElementById('cp-'+id);btn.textContent='✓ ref';btn.classList.add('copied');addLog('info','ref copied');setTimeout(()=>{btn.textContent='ref';btn.classList.remove('copied')},2000)})}
+function cpLink(id){const url=location.origin+'/api/files/'+id;const btn=document.getElementById('cp-'+id);copyText(url).then(()=>{btn.textContent='✓ ref';btn.classList.add('copied');addLog('info','ref copied');setTimeout(()=>{btn.textContent='ref';btn.classList.remove('copied')},2000)}).catch(()=>{btn.textContent='✗ ref';addLog('warning','ref copy failed');setTimeout(()=>{btn.textContent='ref'},2000)})}
 async function rmFile(id,name){await apiFetch('/api/files/'+id,{method:'DELETE'});expandedFolders.delete(id);addLog('warning',`rm: ${name}`);loadFiles()}
 async function purgeAll(){if(!confirm('git reset --hard — remove all files?'))return;await apiFetch('/api/files/purge',{method:'POST'});expandedFolders.clear();addLog('warning','reset: all files purged');loadFiles()}
 
@@ -551,15 +551,32 @@ function renderMessages(){
   if(!messages.length){el.innerHTML='<div class="chat-empty"><span class="big">💬</span>no messages yet — send something</div>';return}
   el.innerHTML=messages.map(m=>{
     const mine=m.device===dev;
-    return`<div class="msg ${mine?'mine':'theirs'}"><div class="msg-bubble">${esc(m.text)}</div><div class="msg-meta"><span class="msg-device">${esc(m.device)}</span><span>${fmtTime(m.time)}</span><span class="msg-copy" onclick="copyMsg(this,'${esc(m.text).replace(/'/g,"\\'")}')">copy</span></div></div>`;
+    return`<div class="msg ${mine?'mine':'theirs'}"><div class="msg-bubble">${esc(m.text)}</div><div class="msg-meta"><span class="msg-device">${esc(m.device)}</span><span>${fmtTime(m.time)}</span><span class="msg-copy" data-msg-id="${esc(m.id)}" onclick="copyMsg(this)">copy</span></div></div>`;
   }).join('');
   scrollChat();
 }
 
-function copyMsg(el,text){
-  // Decode escaped HTML back for clipboard
-  const ta=document.createElement('textarea');ta.innerHTML=text;
-  navigator.clipboard.writeText(ta.value).then(()=>{el.textContent='copied!';setTimeout(()=>{el.textContent='copy'},1500)});
+// navigator.clipboard only exists in a secure context; over plain http:// on the
+// LAN it is undefined, so fall back to the old execCommand trick.
+function copyText(text){
+  if(navigator.clipboard&&window.isSecureContext)return navigator.clipboard.writeText(text);
+  return new Promise((resolve,reject)=>{
+    const ta=document.createElement('textarea');
+    ta.value=text;ta.setAttribute('readonly','');
+    ta.style.position='fixed';ta.style.top='-1000px';ta.style.opacity='0';
+    document.body.appendChild(ta);
+    ta.select();ta.setSelectionRange(0,ta.value.length);
+    let ok=false;try{ok=document.execCommand('copy')}catch(e){}
+    document.body.removeChild(ta);
+    ok?resolve():reject(new Error('copy unavailable'));
+  });
+}
+
+function copyMsg(el){
+  const m=messages.find(m=>m.id===el.dataset.msgId);
+  if(!m)return;
+  const done=t=>{el.textContent=t;setTimeout(()=>{el.textContent='copy'},1500)};
+  copyText(m.text).then(()=>done('copied!')).catch(()=>done('copy failed'));
 }
 
 async function pollMessages(){
