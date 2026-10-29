@@ -4,8 +4,8 @@ gitdrop v1.2 — self-hosted file exchange + messaging
 Run: python3 gitdrop.py [--port 7070] [--host 0.0.0.0]
 """
 
-import os, sys, json, uuid, hashlib, zipfile, argparse, mimetypes, time
-from datetime import datetime, timezone
+import os, sys, json, uuid, hashlib, zipfile, argparse, mimetypes, time, threading
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from functools import wraps
 
@@ -20,6 +20,9 @@ STORAGE_DIR.mkdir(exist_ok=True)
 META_FILE = STORAGE_DIR / ".meta.json"
 MSGS_FILE = STORAGE_DIR / ".messages.json"
 MAX_UPLOAD_MB = 2048
+# Файлы и сообщения старше TTL удаляются автоматически.
+TTL_HOURS = float(os.environ.get("GITDROP_TTL_HOURS", "8"))
+CLEANUP_INTERVAL_SEC = 60
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
@@ -27,12 +30,20 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 def load_meta():
     if META_FILE.exists(): return json.loads(META_FILE.read_text())
     return {}
-def save_meta(meta): META_FILE.write_text(json.dumps(meta, indent=2))
+def save_meta(meta): _atomic_write(META_FILE, json.dumps(meta, indent=2))
 
 def load_msgs():
     if MSGS_FILE.exists(): return json.loads(MSGS_FILE.read_text())
     return []
-def save_msgs(msgs): MSGS_FILE.write_text(json.dumps(msgs, indent=2))
+def save_msgs(msgs): _atomic_write(MSGS_FILE, json.dumps(msgs, indent=2))
+
+# Запись через временный файл: читатель не увидит наполовину записанный JSON.
+def _atomic_write(path: Path, text: str):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text); os.replace(tmp, path)
+
+# Сериализует read-modify-write мета/сообщений между запросами и чистильщиком.
+_lock = threading.Lock()
 
 def file_hash(path: Path) -> str:
     h = hashlib.sha1()
@@ -62,7 +73,8 @@ def list_files():
         if fpath.exists():
             files.append({"id":fid,"name":info["name"],"size":fpath.stat().st_size,
                 "hash":info["hash"],"mime":info.get("mime","application/octet-stream"),
-                "uploaded":info["uploaded"],"is_folder":info.get("is_folder",False),
+                "uploaded":info["uploaded"],"expires":expires_at(info["uploaded"]),
+                "is_folder":info.get("is_folder",False),
                 "file_count":info.get("file_count",0)})
     return jsonify(files)
 
@@ -70,16 +82,19 @@ def list_files():
 @check_auth
 def upload_files():
     if "files" not in request.files: return jsonify({"error":"no files"}), 400
-    meta = load_meta(); uploaded = []
+    entries = {}; uploaded = []
     for f in request.files.getlist("files"):
         fid = uuid.uuid4().hex[:12]; fpath = STORAGE_DIR / fid; f.save(fpath)
         h = file_hash(fpath)
         mime = f.content_type or mimetypes.guess_type(f.filename)[0] or "application/octet-stream"
-        meta[fid] = {"name":f.filename,"hash":h,"mime":mime,
+        entries[fid] = {"name":f.filename,"hash":h,"mime":mime,
             "uploaded":datetime.now(timezone.utc).isoformat(),"is_folder":False}
         uploaded.append({"id":fid,"name":f.filename,"size":fpath.stat().st_size,
-            "hash":h,"mime":mime,"uploaded":meta[fid]["uploaded"],"is_folder":False})
-    save_meta(meta); return jsonify(uploaded), 201
+            "hash":h,"mime":mime,"uploaded":entries[fid]["uploaded"],
+            "expires":expires_at(entries[fid]["uploaded"]),"is_folder":False})
+    with _lock:
+        meta = load_meta(); meta.update(entries); save_meta(meta)
+    return jsonify(uploaded), 201
 
 @app.route("/api/upload-folder", methods=["POST"])
 @check_auth
@@ -92,13 +107,15 @@ def upload_folder():
     with zipfile.ZipFile(fpath, "w", zipfile.ZIP_DEFLATED) as zf:
         for i, f in enumerate(file_list):
             zf.writestr(paths[i] if i < len(paths) else f.filename, f.read())
-    h = file_hash(fpath); meta = load_meta()
-    meta[fid] = {"name":folder_name+".zip","original_name":folder_name,"hash":h,
+    h = file_hash(fpath)
+    entry = {"name":folder_name+".zip","original_name":folder_name,"hash":h,
         "mime":"application/zip","uploaded":datetime.now(timezone.utc).isoformat(),
         "is_folder":True,"file_count":len(file_list)}
-    save_meta(meta)
+    with _lock:
+        meta = load_meta(); meta[fid] = entry; save_meta(meta)
     return jsonify({"id":fid,"name":folder_name+".zip","size":fpath.stat().st_size,
-        "hash":h,"mime":"application/zip","uploaded":meta[fid]["uploaded"],
+        "hash":h,"mime":"application/zip","uploaded":entry["uploaded"],
+        "expires":expires_at(entry["uploaded"]),
         "is_folder":True,"file_count":len(file_list)}), 201
 
 @app.route("/api/files/<fid>", methods=["GET"])
@@ -126,22 +143,25 @@ def list_folder_contents(fid):
 @app.route("/api/files/<fid>", methods=["DELETE"])
 @check_auth
 def delete_file(fid):
-    meta = load_meta()
-    if fid not in meta: abort(404)
-    fpath = STORAGE_DIR / fid
-    if fpath.exists(): fpath.unlink()
-    name = meta.pop(fid)["name"]; save_meta(meta)
+    with _lock:
+        meta = load_meta()
+        if fid not in meta: abort(404)
+        fpath = STORAGE_DIR / fid
+        if fpath.exists(): fpath.unlink()
+        name = meta.pop(fid)["name"]; save_meta(meta)
     return jsonify({"deleted": name})
 
 @app.route("/api/files/purge", methods=["POST"])
 @check_auth
 def purge_all():
-    meta = load_meta(); count = 0
-    for fid in list(meta.keys()):
-        fpath = STORAGE_DIR / fid
-        if fpath.exists(): fpath.unlink()
-        count += 1
-    save_meta({}); return jsonify({"purged": count})
+    with _lock:
+        meta = load_meta(); count = 0
+        for fid in list(meta.keys()):
+            fpath = STORAGE_DIR / fid
+            if fpath.exists(): fpath.unlink()
+            count += 1
+        save_meta({})
+    return jsonify({"purged": count})
 
 # ── Messages API ────────────────────────────────────────────────────
 @app.route("/api/messages", methods=["GET"])
@@ -166,22 +186,55 @@ def send_message():
         "ts": time.time(),
         "time": datetime.now(timezone.utc).isoformat(),
     }
-    msgs = load_msgs()
-    msgs.append(msg)
-    # Keep last 500 messages
-    if len(msgs) > 500: msgs = msgs[-500:]
-    save_msgs(msgs)
+    with _lock:
+        msgs = load_msgs()
+        msgs.append(msg)
+        # Keep last 500 messages
+        if len(msgs) > 500: msgs = msgs[-500:]
+        save_msgs(msgs)
     return jsonify(msg), 201
 
 @app.route("/api/messages", methods=["DELETE"])
 @check_auth
 def clear_messages():
-    save_msgs([])
+    with _lock: save_msgs([])
     return jsonify({"cleared": True})
+
+# ── Auto-cleanup ────────────────────────────────────────────────────
+def expires_at(uploaded_iso: str) -> str:
+    return (datetime.fromisoformat(uploaded_iso) + timedelta(hours=TTL_HOURS)).isoformat()
+
+def cleanup_expired():
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=TTL_HOURS)
+    removed_files = removed_msgs = 0
+    with _lock:
+        meta = load_meta()
+        for fid, info in list(meta.items()):
+            if datetime.fromisoformat(info["uploaded"]) < cutoff:
+                (STORAGE_DIR / fid).unlink(missing_ok=True)
+                del meta[fid]; removed_files += 1
+        if removed_files: save_meta(meta)
+        # Файлы без записи в мета (оборванные загрузки и т.п.) — по mtime.
+        for p in STORAGE_DIR.iterdir():
+            if p.name.startswith(".") or p.name in meta or not p.is_file(): continue
+            if p.stat().st_mtime < cutoff.timestamp():
+                p.unlink(missing_ok=True); removed_files += 1
+        msgs = load_msgs()
+        kept = [m for m in msgs if m["ts"] >= cutoff.timestamp()]
+        removed_msgs = len(msgs) - len(kept)
+        if removed_msgs: save_msgs(kept)
+    if removed_files or removed_msgs:
+        print(f"[cleanup] removed {removed_files} files, {removed_msgs} messages older than {TTL_HOURS:g}h")
+
+def cleanup_loop():
+    while True:
+        try: cleanup_expired()
+        except Exception as e: print(f"[cleanup] error: {e}")
+        time.sleep(CLEANUP_INTERVAL_SEC)
 
 # ── Frontend ────────────────────────────────────────────────────────
 @app.route("/")
-def index(): return Response(FRONTEND_HTML, mimetype="text/html")
+def index(): return Response(FRONTEND_HTML.replace("__TTL_HOURS__", f"{TTL_HOURS:g}"), mimetype="text/html")
 
 FRONTEND_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -253,7 +306,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:1
   font-family:var(--font);font-size:11px;padding:4px 12px;border-radius:5px;cursor:pointer;transition:.15s}
 .clear-btn:hover{background:var(--red-dim);border-color:var(--red)}
 .file-list{display:flex;flex-direction:column;gap:6px}
-.file-row{display:grid;grid-template-columns:28px 1fr auto auto auto;
+.file-row{display:grid;grid-template-columns:28px 1fr auto auto auto auto;
   align-items:center;gap:10px;padding:10px 14px;background:var(--bg2);
   border:1px solid var(--border);border-radius:8px;font-size:13px;transition:.15s;animation:slideIn .25s ease-out}
 @keyframes slideIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
@@ -264,6 +317,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:1
 .file-name .folder-badge{font-size:10px;color:var(--cyan);background:rgba(86,212,221,0.1);padding:1px 6px;border-radius:3px;margin-left:6px;font-weight:400}
 .file-hash{color:var(--yellow);font-size:11px;opacity:.7}
 .file-size{color:var(--text-dim);font-size:11px;min-width:60px;text-align:right}
+.file-ttl{color:var(--text-dim);font-size:11px;min-width:52px;text-align:right;opacity:.7}
 .file-btn{background:none;border:1px solid var(--border);color:var(--text-dim);
   font-family:var(--font);font-size:11px;padding:4px 10px;border-radius:5px;cursor:pointer;transition:.15s;white-space:nowrap}
 .file-btn:hover{color:var(--text-bright);border-color:var(--border-hl);background:var(--surface)}
@@ -346,7 +400,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:1
 @media(max-width:640px){
   .header{padding:12px 16px}.main{padding:16px}
   .file-row{grid-template-columns:28px 1fr auto;gap:8px}
-  .file-hash,.file-size{display:none}
+  .file-hash,.file-size,.file-ttl{display:none}
   .stats-bar{padding:8px 16px;gap:12px;flex-wrap:wrap}
   .drop-btns{flex-direction:column;align-items:center}
   .chat-wrap{height:calc(100vh - 160px)}
@@ -385,7 +439,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:1
     <div class="dropzone" id="dropzone">
       <span class="drop-icon" id="dropIcon">↑</span>
       <div class="drop-text" id="dropText">git push — drag files or folders here</div>
-      <div class="drop-hint">drop anything · files, folders, archives · max 2 GB</div>
+      <div class="drop-hint">drop anything · files, folders, archives · max 2 GB · auto-delete after __TTL_HOURS__h</div>
       <div class="drop-btns">
         <button class="drop-btn" onclick="event.stopPropagation();document.getElementById('fileInput').click()">select files</button>
         <button class="drop-btn folder" onclick="event.stopPropagation();document.getElementById('folderInput').click()">select folder</button>
@@ -450,6 +504,7 @@ function getIcon(name,isFolder){
 }
 function fmtSize(b){if(!b)return'0 B';const k=1024,s=['B','KB','MB','GB'];const i=Math.floor(Math.log(b)/Math.log(k));return parseFloat((b/Math.pow(k,i)).toFixed(1))+' '+s[i]}
 function ts(){const d=new Date();return d.toLocaleTimeString('en-US',{hour12:false})+'.'+String(d.getMilliseconds()).padStart(3,'0')}
+function fmtTtl(iso){const m=Math.max(0,Math.round((new Date(iso)-Date.now())/60000));return'⏳ '+(m>=60?Math.floor(m/60)+'h '+String(m%60).padStart(2,'0')+'m':m+'m')}
 function fmtTime(iso){try{return new Date(iso).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false})}catch(e){return''}}
 function addLog(type,text){logs.push({type,text,time:ts()});document.getElementById('logCount').textContent=logs.length;document.getElementById('logEntries').textContent=logs.length+' entries';renderLog()}
 function renderLog(){const el=document.getElementById('logBody');el.innerHTML=logs.map(l=>`<div class="log-line"><span class="log-time">${l.time}</span><span class="log-type ${l.type}">${l.type}</span><span class="log-msg">${l.text}</span></div>`).join('');el.scrollTop=el.scrollHeight}
@@ -489,7 +544,7 @@ function renderFiles(){
   if(!files.length){sec.innerHTML='<div class="empty-state"><span class="big">∅</span>working tree clean — nothing to commit</div>';return}
   sec.innerHTML=`<div class="section-head"><span class="section-title">staged objects (${files.length})</span><button class="clear-btn" onclick="purgeAll()">git reset --hard</button></div><div class="file-list">${files.map(f=>{
     const isF=f.is_folder,expanded=expandedFolders.has(f.id),dn=isF?f.name.replace(/\.zip$/,''):f.name;
-    return`<div class="file-row ${isF?'is-folder':''}"><span class="file-icon">${getIcon(f.name,isF)}</span><span class="file-name">${esc(dn)}${isF?`<span class="folder-badge">${f.file_count} files</span>`:''}</span><span class="file-hash">${f.hash}</span><span class="file-size">${fmtSize(f.size)}</span><div style="display:flex;gap:4px">${isF?`<button class="file-btn peek" onclick="toggleContents('${f.id}')">${expanded?'▾ tree':'▸ tree'}</button>`:''}<button class="file-btn dl" onclick="dlFile('${f.id}','${esc(f.name)}')">fetch</button><button class="file-btn cp" id="cp-${f.id}" onclick="cpLink('${f.id}')">ref</button><button class="file-btn rm" onclick="rmFile('${f.id}','${esc(f.name)}')">rm</button></div></div>${expanded?`<div class="folder-contents" id="fc-${f.id}"><div class="fc-header">loading tree...</div></div>`:''}`}).join('')}</div>`;
+    return`<div class="file-row ${isF?'is-folder':''}"><span class="file-icon">${getIcon(f.name,isF)}</span><span class="file-name">${esc(dn)}${isF?`<span class="folder-badge">${f.file_count} files</span>`:''}</span><span class="file-hash">${f.hash}</span><span class="file-size">${fmtSize(f.size)}</span><span class="file-ttl" title="auto-delete">${fmtTtl(f.expires)}</span><div style="display:flex;gap:4px">${isF?`<button class="file-btn peek" onclick="toggleContents('${f.id}')">${expanded?'▾ tree':'▸ tree'}</button>`:''}<button class="file-btn dl" onclick="dlFile('${f.id}','${esc(f.name)}')">fetch</button><button class="file-btn cp" id="cp-${f.id}" onclick="cpLink('${f.id}')">ref</button><button class="file-btn rm" onclick="rmFile('${f.id}','${esc(f.name)}')">rm</button></div></div>${expanded?`<div class="folder-contents" id="fc-${f.id}"><div class="fc-header">loading tree...</div></div>`:''}`}).join('')}</div>`;
   expandedFolders.forEach(id=>loadFolderContents(id));
 }
 async function toggleContents(id){if(expandedFolders.has(id))expandedFolders.delete(id);else expandedFolders.add(id);renderFiles()}
@@ -640,6 +695,8 @@ loadFiles();
 pollMessages();
 // Poll for new messages every 2 seconds
 pollTimer=setInterval(pollMessages,2000);
+// Refresh file list every minute: TTL countdown + expired files disappear
+setInterval(loadFiles,60000);
 </script>
 </body>
 </html>
@@ -650,8 +707,12 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=7070)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--token", default="", help="Access token (or set GITDROP_TOKEN env)")
+    parser.add_argument("--ttl-hours", type=float, default=TTL_HOURS,
+        help="Auto-delete files and messages after N hours (or set GITDROP_TTL_HOURS env)")
     args = parser.parse_args()
     if args.token: AUTH_TOKEN = args.token
+    TTL_HOURS = args.ttl_hours
+    threading.Thread(target=cleanup_loop, daemon=True).start()
     print(f"""
     ┌─────────────────────────────────────────┐
     │         gitdrop v1.2.0                  │
@@ -660,6 +721,7 @@ if __name__ == "__main__":
     │  storage: {STORAGE_DIR}             │
     │  auth: {'enabled' if AUTH_TOKEN else 'disabled'}                       │
     │  features: files, folders, chat         │
+    │  auto-delete after: {TTL_HOURS:g}h                  │
     └─────────────────────────────────────────┘
     """)
     app.run(host=args.host, port=args.port, debug=False)
